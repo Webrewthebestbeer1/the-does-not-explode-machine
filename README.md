@@ -18,9 +18,15 @@ SPI bus 2
 
 ## Libraries
 
+Arduino STM32 from https://github.com/rogerclarkmelbourne/Arduino_STM32.git (into /hardware directory)
+
 The Adafruit GFX library for the ST7355, ported to the STM32
 
     https://github.com/KenjutsuGH/Adafruit-ST7735-Library
+
+SdFat from
+
+    https://github.com/greiman/SdFat-beta
 
 From the "Manage Libraries..." tool in the Arduino IDE
 
