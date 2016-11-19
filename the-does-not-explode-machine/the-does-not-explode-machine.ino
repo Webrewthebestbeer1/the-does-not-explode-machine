@@ -4,9 +4,13 @@
 #include <Adafruit_ST7735.h>
 #include <SPI.h>
 #include <MapleCoOS116.h>
+#include <math.h>
 #include "TMRpcm.h"
 #include "SDFat.h"
 
+
+#define ADC_CR2_TSEREFE_BIT 23
+#define ADC_CR2_TSEREFE BIT(ADC_CR2_TSEREFE_BIT)
 
 #define SWITCH 11
 #define LED_POWER 12
@@ -28,11 +32,10 @@ volatile int encoderState;
 volatile int encoderFlag;
 boolean A_set;
 boolean B_set;
-volatile int16_t encoderPos;
+volatile int16_t encoderPos, oldEncoderPos;
 volatile int  encoderTimer = millis(); // acceleration measurement
 int encoderPinA = PB4; // pin array of all encoder A inputs
 int encoderPinB = PB5; // pin array of all encoder B inputs
-unsigned int lastEncoderPos;
 
 // timer
 #define ENCODER_RATE 1000    // in microseconds;
@@ -44,16 +47,19 @@ DallasTemperature sensors(&oneWire);
 
 char name[13];
 
-OS_STK   vCubeLoopStk[TASK_STK_SIZE];
+OS_MutexID xSPIFree;
+
+OS_STK   vUpdateCubeStk[TASK_STK_SIZE];
+OS_STK   vUpdateDisplayStk[TASK_STK_SIZE];
 OS_STK   vUpdateSSRStk[TASK_STK_SIZE];
 OS_STK   vUpdateTempStk[TASK_STK_SIZE];
+OS_STK   vUpdateInternalVddTempStk[TASK_STK_SIZE];
 
 unsigned long activatedTime, deactivatedTime = millis();
-float temp1, temp2, oldTemp1;
+float temp1, temp2, oldTemp1, oldTemp2;
+float oldInternalTemp, internalTemp, vdd;
 bool plinged = false;
 int SSR_FREQUENCY = 3000; // in ms
-
-bool sdworked = false;
 
 const float sin_d[] = {
   0, 0.17, 0.34, 0.5, 0.64, 0.77, 0.87, 0.94, 0.98, 1, 0.98, 0.94,
@@ -90,6 +96,16 @@ int cube1_r[] = {
 };
 
 uint16 cube1_x, cube1_y, cube1_color;
+uint16 dataColor, textColor, backgroundColor;
+
+void annoyWithAngryCat() {
+  for (int i = 0; i < 3; i++) {
+    bmpDraw("cat-0.bmp",0,0);
+    bmpDraw("cat-1.bmp",0,0);
+    bmpDraw("cat-2.bmp",0,0);
+    bmpDraw("cat-3.bmp",0,0);
+  }
+}
 
 void setup() {
   /*
@@ -103,41 +119,46 @@ void setup() {
   sensors.setResolution(12);
   tft.initR(INITR_BLACKTAB);
   tft.setRotation(1);
-  tft.fillScreen(ST7735_BLACK);
+  sd.begin(SD_CS, SD_SCK_MHZ(80));
+  annoyWithAngryCat();
+  dataColor = ST7735_GREEN;
+  textColor = ST7735_WHITE;
+  backgroundColor = ST7735_BLACK;
+  tft.fillScreen(backgroundColor);
   tft.setCursor(50, 10);
   tft.setTextSize(3);
   tft.setTextWrap(true);
   Serial.begin(9600);
   initEncoder();
-  cube1_x = ((tft.width()) / 2);
-  cube1_y = ((tft.height()) / 2);
+  cube1_x = 140;
+  cube1_y = 20;
   cube1_color = ST7735_RED;
-  tft.setCursor(120,100),
-  tft.setTextColor(ST7735_WHITE);
+  
+  tft.setCursor(5,15),
+  tft.setTextColor(ST7735_YELLOW);
   tft.setTextSize(2);
-  if (sd.begin(SD_CS, SD_SCK_MHZ(18))) {
-    tft.print("Y");
-    sd.ls();
-    Serial.println("SD working");
-    sdworked = true;
-    bmpDraw("lily128.bmp",0,0);
-  } else {
-    Serial.println("SD not working");
-    tft.print("N");
-  }
+  tft.print("DNEM v1");
+  tft.drawFastHLine(0, 40, 160, ST7735_WHITE);
+  
+  setupInternalVddTempSensor();
   setupCo();
 }
 
 void setupCo() {
   CoInitOS();
-  /*
-  CoCreateTask(vCubeLoopTask,
+  xSPIFree = CoCreateMutex();
+  CoCreateTask(vUpdateCubeTask,
                (void *) 0,
                2,
-               &vCubeLoopStk[TASK_STK_SIZE - 1],
+               &vUpdateCubeStk[TASK_STK_SIZE - 1],
                TASK_STK_SIZE
               );
-              */
+  CoCreateTask(vUpdateDisplayTask,
+               (void *) 0,
+               2,
+               &vUpdateDisplayStk[TASK_STK_SIZE - 1],
+               TASK_STK_SIZE
+              );
   CoCreateTask(vUpdateSSRStateTask,
                (void *) 0,
                2,
@@ -150,38 +171,93 @@ void setupCo() {
                &vUpdateTempStk[TASK_STK_SIZE - 1],
                TASK_STK_SIZE
               );
+  CoCreateTask(vUpdateInternalVddTempTask,
+               (void *) 0,
+               2,
+               &vUpdateInternalVddTempStk[TASK_STK_SIZE - 1],
+               TASK_STK_SIZE
+              );
   CoStartOS();
-  TMRpcm_play(name);
+  //TMRpcm_play(name);
 }
 
-void loop() {
-  if (lastEncoderPos != encoderPos) {
-    /*
-      tft.fillScreen(ST7735_RED);
-      tft.setCursor(50,10);
-      tft.setTextColor(ST7735_WHITE);
-      tft.print((char)encoderPos, DEC);
-    */
-    encoderFlag = LOW;
-    lastEncoderPos = encoderPos;
+void loop() { }
+
+static void vUpdateInternalVddTempTask(void *pdata) {
+  while(1) {
+    // reading Vdd by utilising the internal 1.20V VREF
+    vdd = 1.20 * 4096.0 / adc_read(ADC1, 17);
+    // following 1.43 and 0.0043 parameters come from F103 datasheet - ch. 5.9.13
+    // and need to be calibrated for every chip (large fab parameters variance)
+    internalTemp = (1.43 - (vdd / 4096.0 * adc_read(ADC1, 16))) / 0.0043 + 25.0;
+    CoTickDelay(1000);
   }
 }
 
-static void vCubeLoopTask(void *pdata) {
+static void vUpdateCubeTask(void *pdata) {
   while (1) {
-    Serial.println((sdworked) ? "yes" : "no");
     cube(cube1_px, cube1_py, cube1_pz, cube1_p2x, cube1_p2y, cube1_r, &cube1_x, &cube1_y, &cube1_color);
+    CoTickDelay(205 - 2 * encoderPos);
+  }
+}
+
+static void vUpdateDisplayTask(void *pdata) {
+  while (1) {
     if (oldTemp1 != temp1) {
-      tft.setCursor(50, 10);
-      tft.setTextSize(3);
-      tft.setTextColor(ST7735_BLACK);
-      tft.print((char)oldTemp1, DEC);
-      tft.setCursor(50, 10);
-      tft.setTextColor(ST7735_WHITE);
-      tft.print((char)temp1, DEC);
+      tft.setCursor(5, 50);
+      tft.setTextSize(1);
+      tft.setTextColor(backgroundColor);
+      tft.print("Coil: ");
+      tft.print((float)oldTemp1, 2);
+      tft.print("'C");
+      tft.setCursor(5, 50);
+      tft.setTextColor(textColor);
+      tft.print("Coil: ");
+      tft.setTextColor(dataColor);
+      tft.print((float)temp1, 2);
+      tft.print("'C");
       oldTemp1 = temp1;
     }
-    CoTickDelay(205 - 2 * encoderPos);
+    if (oldInternalTemp != internalTemp) {
+      tft.setCursor(5, 60);
+      tft.setTextSize(1);
+      tft.setTextColor(ST7735_BLACK);
+      tft.print("Ambient: ");
+      tft.print((float)oldInternalTemp - 18, 2);
+      tft.print("'C");
+      tft.setCursor(5, 60);
+      tft.setTextColor(ST7735_WHITE);
+      tft.print("Ambient: ");
+      tft.print((float)internalTemp - 18, 2);
+      tft.print("'C");
+      oldInternalTemp = internalTemp;
+    }
+    if (oldEncoderPos != encoderPos) {
+      int oldW = ((float)oldEncoderPos/100) * 2000;
+      int newW = ((float)encoderPos/100) * 2000;
+      tft.setTextSize(1);
+      tft.fillRect(5, 70, 155, 15, backgroundColor);
+      tft.setCursor(5, 70);
+      tft.setTextColor(ST7735_WHITE);
+      tft.print("Work: ");
+      tft.print((char)encoderPos, DEC);
+      tft.print("%");
+      tft.print(" - ");
+      tft.print((int16_t)newW, DEC);
+      tft.print("W");
+      oldEncoderPos = encoderPos;
+      encoderFlag = LOW;
+    }
+
+    if (encoderPos == 20) {
+      //CoEnterMutexSection(xSPIFree);
+      CoSchedLock();
+      annoyWithAngryCat();
+      CoSchedUnlock();
+      //CoLeaveMutexSection(xSPIFree);
+      CoTickDelay(3);
+      tft.fillScreen(ST7735_BLACK);
+    }
   }
 }
 
@@ -227,8 +303,8 @@ void updateSSRState() {
   }
 }
 
-void incrementEncoder(uint8_t increment) {
-  int8_t newEncoderPos = encoderPos + increment;
+void incrementEncoder(uint32_t increment) {
+  int32_t newEncoderPos = encoderPos + increment;
   if (newEncoderPos > 100) newEncoderPos = 100;
   if (newEncoderPos < 0) newEncoderPos = 0;
   encoderPos = newEncoderPos;
@@ -264,8 +340,8 @@ void cube(float *px, float *py, float *pz, float *p2x, float *p2y, int *r, uint1
     float ay = sin_d[r[2]] * px3 + cos_d[r[2]] * py3;
     float az = pz3 - 190;
 
-    p2x[i] = *x + ax * 500 / az;
-    p2y[i] = *y + ay * 500 / az;
+    p2x[i] = *x + ax * 300 / az;
+    p2y[i] = *y + ay * 300 / az;
   }
 
   for (int i = 0; i < 3; i++) {
@@ -279,19 +355,27 @@ void cube(float *px, float *py, float *pz, float *p2x, float *p2y, int *r, uint1
   tft.drawLine(p2x[3], p2y[3], p2x[7], p2y[7], *color);
 }
 
+uint32_t getEncoderAccValue() {
+  float deltaT = (float)millis() - (float)encoderTimer;
+  float value = 150. / deltaT;
+  if (value < 1) return 1;
+  return (uint8_t)value;
+}
+
 void readEncoder() {
   if ((gpio_read_bit(PIN_MAP[encoderPinA].gpio_device, PIN_MAP[encoderPinA].gpio_bit) ? HIGH : LOW) != A_set) {
     A_set = !A_set;
     if (A_set && !B_set) {
-      incrementEncoder(1);
+      incrementEncoder(getEncoderAccValue());
+      encoderTimer = millis();
     }
-    encoderTimer = millis();
   }
   if ((gpio_read_bit(PIN_MAP[encoderPinB].gpio_device, PIN_MAP[encoderPinB].gpio_bit) ? HIGH : LOW) != B_set) {
     B_set = !B_set;
-    if (B_set && !A_set)
-      incrementEncoder(-1);
-    encoderTimer = millis();
+    if (B_set && !A_set) {
+      incrementEncoder(-getEncoderAccValue());
+      encoderTimer = millis();
+    }
   }
 }
 
@@ -304,7 +388,7 @@ void initEncoder() {
   encoderPos = 0;
   pinMode(encoderPinA, INPUT_PULLUP);
   pinMode(encoderPinB, INPUT_PULLUP);
-  lastEncoderPos = 1;
+  oldEncoderPos = 1;
 
   // timer setup for encoder
   timer.pause();
@@ -333,11 +417,7 @@ void bmpDraw(char *filename, uint8_t x, uint16_t y) {
   uint8_t  r, g, b;
   uint32_t pos = 0, startTime = millis();
 
-  //if((x > tft.width()) || (y > tft.height())) return;
-tft.setCursor(0,0);
-  tft.setTextColor(ST7735_WHITE);
-  
-  
+  if((x > tft.width()) || (y > tft.height())) return;
 
   // Open requested file on SD card
   if ((bmpFile = sd.open(filename)) == NULL) {
@@ -350,14 +430,17 @@ tft.setCursor(0,0);
   // Parse BMP header
   if(read16(bmpFile) == 0x4D42) { // BMP signature
     
-    (void)read32(bmpFile); // Read & ignore creator bytes
+    (void)read32(bmpFile); // images size
+    (void)read16(bmpFile); // zeroes
+    (void)read16(bmpFile); // zeroes
     bmpImageoffset = read32(bmpFile); // Start of image data
+    (void)read32(bmpFile); // BITMAPINFOHEADER
     // Read DIB header
     bmpWidth  = read32(bmpFile);
     bmpHeight = read32(bmpFile);
     if(read16(bmpFile) == 1) { // # planes -- must be '1'
       bmpDepth = read16(bmpFile); // bits per pixel
-      if(true) { //(bmpDepth == 24) && (read32(bmpFile) == 0)) { // 0 = uncompressed
+      if((bmpDepth == 24) && (read32(bmpFile) == 0)) { // 0 = uncompressed
 
         goodBmp = true; // Supported BMP format -- proceed!
 
@@ -414,8 +497,7 @@ tft.setCursor(0,0);
       } // end goodBmp
     }
   }
-  if (goodBmp) tft.print("GOOD");
-  else tft.print("BAD");
+  if (!goodBmp) tft.print("BAD");
   bmpFile.close();
 }
 
@@ -439,3 +521,11 @@ uint32_t read32(File &f) {
   return result;
 }
 
+void setupInternalVddTempSensor() {
+    adc_reg_map *regs = ADC1->regs;
+    regs->CR2 |= ADC_CR2_TSEREFE;    // enable VREFINT and temperature sensor
+    // sample rate for VREFINT ADC channel and for temperature sensor
+    regs->SMPR1 |=  (0b111 << 18);  // sample rate temperature
+    regs->SMPR1 |=  (0b111 << 21);  // sample rate vrefint
+    adc_calibrate(ADC1);
+}
